@@ -1,0 +1,232 @@
+from cozmo_fsm import *
+import math
+import pickle
+import cv2
+import numpy as np
+from matplotlib import pyplot as plt
+from sklearn import svm
+from pathlib import Path
+# import the necessary packages
+import numpy as np
+import argparse
+import imutils
+import glob
+np.set_printoptions(threshold=np.nan)
+class Classify(StateNode):
+    def __init__(self, confidenceThresh=0.2, overlapThresh=0.5):
+        super().__init__()
+        cv2.namedWindow("Image")
+        cv2.namedWindow("Edges")
+        self.filename = "template0.jpg"
+
+        self.template = cv2.imread(self.filename)
+        self.template = cv2.cvtColor(self.template, cv2.COLOR_BGR2GRAY)
+        self.diff = 50
+        start = (self.template.shape[1]//2-self.diff,self.template.shape[0]//2-self.diff)
+        end = (self.template.shape[1]//2+self.diff,self.template.shape[0]//2+self.diff)
+        
+        self.template = self.template[start[1]:end[1],start[0]:end[0]]
+        cv2.imwrite("temp.jpg",self.template)
+
+        self.template = cv2.Canny(self.template, 100, 200)
+        self.template = cv2.resize(self.template,(50,50))
+        (self.h, self.w) = self.template.shape[:2]
+        self.threshold = confidenceThresh
+        self.overlapThresh = overlapThresh
+        self.showEdges = False
+        self.numScales = 20
+        
+    def non_max_suppression_fast(self, boxes, overlapThresh):
+       # if there are no boxes, return an empty list
+       if len(boxes) == 0:
+          return []
+
+       # if the bounding boxes integers, convert them to floats --
+       # this is important since we'll be doing a bunch of divisions
+       if boxes.dtype.kind == "i":
+          boxes = boxes.astype("float")
+    #  
+       # initialize the list of picked indexes   
+       pick = []
+
+       # grab the coordinates of the bounding boxes
+       x1 = boxes[:,0]
+       y1 = boxes[:,1]
+       x2 = boxes[:,2]
+       y2 = boxes[:,3]
+
+       # compute the area of the bounding boxes and sort the bounding
+       # boxes by the bottom-right y-coordinate of the bounding box
+       area = (x2 - x1 + 1) * (y2 - y1 + 1)
+       idxs = np.argsort(y2)
+
+       # keep looping while some indexes still remain in the indexes
+       # list
+       while len(idxs) > 0:
+          # grab the last index in the indexes list and add the
+          # index value to the list of picked indexes
+          last = len(idxs) - 1
+          i = idxs[last]
+          pick.append(i)
+
+          # find the largest (x, y) coordinates for the start of
+          # the bounding box and the smallest (x, y) coordinates
+          # for the end of the bounding box
+          xx1 = np.maximum(x1[i], x1[idxs[:last]])
+          yy1 = np.maximum(y1[i], y1[idxs[:last]])
+          xx2 = np.minimum(x2[i], x2[idxs[:last]])
+          yy2 = np.minimum(y2[i], y2[idxs[:last]])
+
+          # compute the width and height of the bounding box
+          w = np.maximum(0, xx2 - xx1 + 1)
+          h = np.maximum(0, yy2 - yy1 + 1)
+
+          # compute the ratio of overlap
+          overlap = (w * h) / area[idxs[:last]]
+
+          # delete all indexes from the index list that have
+          idxs = np.delete(idxs, np.concatenate(([last],
+             np.where(overlap > overlapThresh)[0])))
+
+       # return only the bounding boxes that were picked using the
+       # integer data type
+       return boxes[pick].astype("int")
+
+
+    def start(self,event=None):
+        if self.running: return
+
+        super().start(event)
+
+        self.raw_img = self.robot.world.latest_image.raw_image
+        image = self.raw_img.convert('RGB') 
+        image = np.array(image)
+        # cv2.imshow("image",image)
+
+        gray = self.raw_img.convert('L') 
+        gray = np.array(gray)
+        (h,w) = (self.h, self.w)
+        found = None
+        # loop over the scales of the image
+        loc = []
+        crec = []
+        for scale in np.linspace(0.2, 1.0, self.numScales)[::-1]:
+            # resize the image according to the scale, and keep track
+            # of the ratio of the resizing
+            resized = imutils.resize(gray, width = int(gray.shape[1] * scale))
+            r = gray.shape[1] / float(resized.shape[1])
+            # if the resized image is smaller than the template, then break
+            # from the loop
+            if resized.shape[0] < h or resized.shape[1] < w:
+                break
+
+            # detect edges in the resized, grayscale image and apply template
+            # matching to find the template in the image
+            edged = cv2.Canny(resized, 100, 200)
+            result = cv2.matchTemplate(edged, self.template, cv2.TM_CCOEFF_NORMED)
+
+            loc = np.where( result >= self.threshold)
+            for pt in zip(*loc[::-1]):
+                startend = (int(pt[0]*r),int(pt[1]*r),int((pt[0]+w)*r),int((pt[1]+h)*r))
+                crec.append(startend)
+                            
+            # check to see if the iteration should be visualized
+            if (self.showEdges):
+                # draw a bounding box around the detected region
+                clone = np.dstack([edged, edged, edged])
+                cv2.rectangle(clone, (maxLoc[0], maxLoc[1]),
+                    (maxLoc[0] + w, maxLoc[1] + h), (0, 0, 255), 2)
+                cv2.imshow("Visualize", clone)
+                cv2.waitKey(0)
+
+        
+        boxes = self.non_max_suppression_fast(np.array(crec),self.overlapThresh)
+        
+        results = []
+        for box in boxes:
+            foundIn = None
+            cv2.rectangle(image, (box[0],box[1]),(box[2],box[3]), (255,0,255), 1)
+            croppedGray = gray[box[1]:box[3], box[0]:box[2]]
+            for scale in np.linspace(0.2, 1.0, 20)[::-1]:
+                # resize the image according to the scale, and keep track
+                # of the ratio of the resizing
+                
+                resized = imutils.resize(croppedGray, width = int(croppedGray.shape[1] * scale))
+                r = croppedGray.shape[1] / float(resized.shape[1])
+
+                # if the resized image is smaller than the template, then break
+                # from the loop
+                if resized.shape[0] < h or resized.shape[1] < w:
+                    break
+                # detect edges in the resized, grayscale image and apply template
+                # matching to find the template in the image
+                edged = cv2.Canny(resized, 100, 200)
+                resultIn = cv2.matchTemplate(edged, self.template, cv2.TM_CCOEFF_NORMED)
+                minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(resultIn)
+                
+                # if we have found a new maximum correlation value, then update
+                # the bookkeeping variable
+                if foundIn is None or maxVal > foundIn[0]:
+                    foundIn = (maxVal, maxLoc, r)
+            (maxVal, maxLoc, r) = foundIn
+            # print(maxLoc)
+            maxLoc = (maxLoc[0] + box[0]/r ,  maxLoc[1] + box[1]/r)
+            
+            (startX, startY) = (int(maxLoc[0] * r), int(maxLoc[1] * r))
+            (endX, endY) = (int((maxLoc[0] + w) * r), int((maxLoc[1] + h) * r))
+            print(startX,startY,endX,endY)
+            results.append((int((maxLoc[0]+w//2)*r),(int((maxLoc[1]+h//2)*r))))
+            # draw a bounding box around the detected result and display the image
+            cv2.rectangle(image, (startX, startY), (endX, endY), (0, 0, 255), 3)
+        
+         
+        cv2.imshow("Image",image)
+        cv2.imshow("Edges", cv2.Canny(gray, 100, 200))
+        self.post_data(results)
+        # if (len(boxes)>0):
+            # self.post_success()
+        # else:
+            # self.post_failure()
+
+class ShowTemplate(StateNode):
+    def __init__(self):
+        super().__init__()
+
+    def start(self,event=None):
+        if self.running: return
+        print(event)
+        super().start(event)
+        cv2.namedWindow("TemplateImage")
+        cv2.namedWindow("TemplateFinal")
+        self.filename = "template0.jpg"
+
+        self.template = cv2.imread(self.filename)
+        self.template = cv2.cvtColor(self.template, cv2.COLOR_BGR2GRAY)
+        self.diff = 50
+        start = (self.template.shape[1]//2-self.diff,self.template.shape[0]//2-self.diff)
+        end = (self.template.shape[1]//2+self.diff,self.template.shape[0]//2+self.diff)
+        
+        self.template = self.template[start[1]:end[1],start[0]:end[0]]
+        cv2.imshow("TemplateImage",self.template)
+        self.template = cv2.Canny(self.template, 100, 200)
+        self.template = cv2.resize(self.template,(50,50))
+        (self.h, self.w) = self.template.shape[:2]
+        cv2.imshow("TemplateFinal",self.template)
+        self.post_completion()
+
+
+
+class msmFinal(StateMachineProgram):
+  $setup{
+
+  ColorImageEnabled(False) =C=> saveImages
+  saveImages: Print("Does the template image look right? (y/n) or Use old template (p)")
+  saveImages =TM('y')=> Print("newimage") =N=> SaveImage("template") =N=> ShowTemplate() =C=> Print("Template Saved. Now matching.") =N=> x
+  saveImages =TM('p')=> ShowTemplate() =C=> x  
+  saveImages =TM()=> saveImages
+  x: Classify(0.3,0.5)
+  x =D=> Print() =N=> pr
+  pr: Print("Classify again? (y/n)")
+  pr =TM('y')=> x
+  pr =TM()=> StateNode()
+  }
